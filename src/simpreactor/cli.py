@@ -4,16 +4,152 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any, Dict
 
 import numpy as np
 import typer
 
-from simpreactor.kinetics import ArrheniusKinetics, PowerLawKinetics
+from simpreactor.kinetics import (
+    ArrheniusKinetics,
+    LHHWKinetics,
+    PowerLawKinetics,
+)
+from simpreactor.thermo import IdealGasThermo, SpeciesProperties
 from simpreactor.persistence import sqlite_store
-from simpreactor.reactors import CSTRConfiguration, build_cstr_rhs, solve_cstr
+from simpreactor.reactors import (
+    CSTRConfiguration,
+    PFRConfiguration,
+    build_cstr_rhs,
+    build_pfr_rhs,
+    solve_cstr,
+    solve_pfr,
+)
 
 app = typer.Typer(add_completion=False)
+
+
+def _parse_kinetics(data: Dict[str, Any]) -> Any:
+    k_type = data.get("type", "power_law").lower()
+    arr_data = data["arrhenius"]
+    arrhenius = ArrheniusKinetics(
+        pre_exponential=float(arr_data["A"]),
+        activation_energy=float(arr_data["Ea"]),
+    )
+
+    if k_type == "power_law":
+        return PowerLawKinetics(
+            arrhenius=arrhenius, exponents=data.get("exponents", {})
+        )
+    elif k_type == "lhhw":
+        ads_consts = {}
+        for sp, p in data.get("adsorption_constants", {}).items():
+            ads_consts[sp] = ArrheniusKinetics(
+                pre_exponential=float(p["A"]), activation_energy=float(p["Ea"])
+            )
+        return LHHWKinetics(
+            arrhenius=arrhenius,
+            numerator_exponents=data.get("numerator_exponents", {}),
+            adsorption_constants=ads_consts,
+            denominator_exponent=float(data.get("denominator_exponent", 1.0)),
+        )
+    else:
+        raise ValueError(f"Unknown kinetics type: {k_type}")
+
+
+def _parse_thermo(data: Dict[str, Any]) -> IdealGasThermo:
+    props = {}
+    for name, p in data.get("species", {}).items():
+        props[name] = SpeciesProperties(
+            molecular_weight=float(p["mw"]),
+            heat_capacity=float(p["cp"]),
+            heat_of_formation=float(p["h_form"]),
+        )
+    return IdealGasThermo(props)
+
+
+@app.command()
+def run(
+    config_file: Annotated[
+        Path, typer.Argument(help="Path to JSON configuration file.")
+    ],
+    output: Annotated[
+        Path | None, typer.Option(help="Path to save output JSON.")
+    ] = None,
+) -> None:
+    """Run a reactor simulation from a config file."""
+    with open(config_file, "r") as f:
+        config = json.load(f)
+
+    reactor_type = config.get("reactor_type", "PFR").upper()
+
+    # Common parsing
+    kinetics = _parse_kinetics(config["kinetics"])
+    thermo = _parse_thermo(config["thermo"])
+    stoich_map = config["stoichiometry"]
+    species_order = list(config["thermo"]["species"].keys()) # Ensure consistency
+    stoichiometry = [stoich_map.get(s, 0.0) for s in species_order]
+
+    # Calculate reaction enthalpy at reference T (simplified)
+    # DeltaH = sum(nu_i * h_f_i)
+    reaction_enthalpy = 0.0
+    for s, coeff in stoich_map.items():
+        # Check if species exists in thermo
+        if s in thermo.properties:
+            reaction_enthalpy += coeff * thermo.properties[s].heat_of_formation
+
+    if reactor_type == "PFR":
+        r_conf = config["reactor_config"]
+        pfr_config = PFRConfiguration(
+            length=float(r_conf["length"]),
+            diameter=float(r_conf["diameter"]),
+            overall_heat_transfer_coefficient=float(r_conf.get("U", 0.0)),
+            perimeter_temperature=float(r_conf.get("Tw", 298.15)),
+        )
+
+        inlet = config["inlet"]
+        T0 = float(inlet["T"])
+        P0 = float(inlet["P"])
+        flow_rate = float(inlet["flow_rate"]) # mol/s
+        comp = inlet["composition"] # mole fractions
+
+        # Initial State: [F1, ..., FN, T, P]
+        flows = []
+        for s in species_order:
+            flows.append(flow_rate * comp.get(s, 0.0))
+
+        initial_state = np.array(flows + [T0, P0])
+
+        rhs = build_pfr_rhs(
+            kinetics=kinetics,
+            thermo=thermo,
+            species_order=species_order,
+            stoichiometry=stoichiometry,
+            reaction_enthalpy=reaction_enthalpy,
+            configuration=pfr_config,
+        )
+
+        points = config.get("solver", {}).get("points", 100)
+        result = solve_pfr(rhs, initial_state, pfr_config.length, points)
+
+        # Prepare output
+        data = {
+            "z": result.t.tolist(),
+            "species": {},
+            "T": result.y[-2].tolist(),
+            "P": result.y[-1].tolist()
+        }
+        for i, s in enumerate(species_order):
+            data["species"][s] = result.y[i].tolist() # Molar flows
+
+        json_output = json.dumps(data, indent=2)
+        typer.echo(json_output)
+
+        if output:
+            with open(output, "w") as f:
+                f.write(json_output)
+
+    else:
+        typer.echo(f"Reactor type {reactor_type} not supported in generic run command yet.")
 
 
 @app.command()

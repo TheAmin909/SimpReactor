@@ -8,7 +8,9 @@ from typing import Callable, Mapping, Sequence
 import numpy as np
 from scipy.integrate import solve_ivp
 
-from simpreactor.kinetics import PowerLawKinetics
+from simpreactor.constants import R_GAS
+from simpreactor.kinetics import KineticsModel, PowerLawKinetics
+from simpreactor.thermo import ThermoInterface
 
 
 @dataclass(frozen=True)
@@ -21,11 +23,27 @@ class CSTRConfiguration:
     jacket_heat_capacity: float
 
 
+@dataclass(frozen=True)
+class PFRConfiguration:
+    length: float
+    diameter: float
+    overall_heat_transfer_coefficient: float = 0.0  # U [W/m2/K]
+    perimeter_temperature: float = 298.15  # T_jacket [K]
+
+    @property
+    def cross_sectional_area(self) -> float:
+        return np.pi * (self.diameter / 2.0) ** 2
+
+    @property
+    def perimeter(self) -> float:
+        return np.pi * self.diameter
+
+
 def build_cstr_rhs(
     inflow_concentrations: Mapping[str, float],
     inflow_temperature: float,
     inflow_rate: float,
-    kinetics: PowerLawKinetics,
+    kinetics: KineticsModel,
     species_order: Sequence[str],
     reaction_enthalpy: float,
     configuration: CSTRConfiguration,
@@ -49,10 +67,12 @@ def build_cstr_rhs(
         conc_map = {name: value for name, value in zip(species_order, concentrations, strict=False)}
         rate = kinetics.rate(conc_map, temperature)
 
+        # TODO: Generalize stoichiometry. Currently hardcoded A->B logic if 2 species
         reaction_term = np.zeros_like(concentrations)
-        reaction_term[0] = -rate
-        if len(concentrations) > 1:
-            reaction_term[1] = rate
+        if len(concentrations) >= 1:
+            reaction_term[0] = -rate # A consumes
+        if len(concentrations) >= 2:
+            reaction_term[1] = rate  # B produces
 
         dcdt = (inflow_rate * (inflow - concentrations)) / volume + reaction_term
 
@@ -84,4 +104,99 @@ def solve_cstr(
         initial_state,
         t_eval=evaluation_times,
         method="BDF",
+    )
+
+
+def build_pfr_rhs(
+    kinetics: KineticsModel,
+    thermo: ThermoInterface,
+    species_order: Sequence[str],
+    stoichiometry: Sequence[float],
+    reaction_enthalpy: float,
+    configuration: PFRConfiguration,
+) -> Callable[[float, np.ndarray], np.ndarray]:
+    """Build the RHS for a steady-state PFR (d/dz).
+
+    State vector: [F_1, F_2, ..., F_N, T, P]
+    Independent variable: z (axial distance)
+    """
+    area = configuration.cross_sectional_area
+    perimeter = configuration.perimeter
+    U = configuration.overall_heat_transfer_coefficient
+    Tj = configuration.perimeter_temperature
+    stoich_arr = np.array(stoichiometry)
+
+    def rhs(z: float, state: np.ndarray) -> np.ndarray:
+        flows = state[:-2] # mol/s
+        T = state[-2]
+        P = state[-1]
+
+        total_flow = np.sum(flows)
+        # Calculate concentrations: Ci = (Fi / F_total) * (P / RT)
+        # Volume flow v = F_total * R * T / P
+        if total_flow <= 1e-12:
+             # Avoid division by zero if flow stops (shouldn't happen in steady PFR usually)
+             concentration_factor = 0.0
+        else:
+             concentration_factor = P / (R_GAS * T * total_flow)
+
+        concentrations = flows * concentration_factor
+        conc_map = {name: val for name, val in zip(species_order, concentrations, strict=False)}
+
+        # 1. Reaction Rate
+        r = kinetics.rate(conc_map, T) # mol/m3/s
+
+        # dFi/dz = nu_i * r * Ac
+        dFdz = stoich_arr * r * area
+
+        # 2. Energy Balance
+        # dT/dz = ( - sum(dH * r) * Ac - U * perim * (T - Tj) ) / sum(Fi * Cpi)
+
+        # Heat of reaction term
+        # If reaction_enthalpy is DeltaH_rxn [J/mol_rxn]
+        heat_gen = -reaction_enthalpy * r * area # Watts/m
+
+        heat_loss = U * perimeter * (T - Tj) # Watts/m
+
+        # Mixture Heat Capacity
+        # sum(Fi * Cpi)
+        # We need individual Cp or mixture Cp?
+        # sum(Fi * Cpi) = F_total * Cp_mix_molar
+
+        # Get Cp_mix [J/mol/K] from thermo
+        # Thermo expects mole fractions
+        mole_fractions = flows / total_flow if total_flow > 0 else np.zeros_like(flows)
+        mf_map = {name: val for name, val in zip(species_order, mole_fractions, strict=False)}
+
+        cp_mix = thermo.heat_capacity(T, mf_map) # J/mol/K
+        total_heat_capacity_flow = total_flow * cp_mix # (mol/s) * (J/mol/K) = W/K
+
+        if total_heat_capacity_flow > 1e-12:
+            dTdz = (heat_gen - heat_loss) / total_heat_capacity_flow
+        else:
+            dTdz = 0.0
+
+        # 3. Pressure Drop (Ergun) - Ignored for MVP M1
+        dPdz = 0.0
+
+        return np.concatenate([dFdz, [dTdz, dPdz]])
+
+    return rhs
+
+
+def solve_pfr(
+    rhs: Callable[[float, np.ndarray], np.ndarray],
+    initial_state: np.ndarray, # [F0..., T0, P0]
+    length: float,
+    evaluation_points: int = 100,
+) -> solve_ivp:
+    z_span = (0.0, length)
+    z_eval = np.linspace(0.0, length, evaluation_points)
+
+    return solve_ivp(
+        rhs,
+        z_span,
+        initial_state,
+        t_eval=z_eval,
+        method="BDF", # PFRs can be stiff
     )
